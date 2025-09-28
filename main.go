@@ -136,8 +136,15 @@ func (s *SQLiteStorage) Close() error {
 
 // User represents a user document from Firestore
 type User struct {
-	ID         string `firestore:"id"`
-	APIKeyHash string `firestore:"apiKeyHash"`
+	ID         string   `firestore:"id"`
+	APIKeyHash string   `firestore:"apiKeyHash"`
+	Devices    []Device `firestore:"devices"`
+}
+
+type Device struct {
+	ID               string `firestore:"id"`
+	RainDetected     string `firestore:"rainDetected"`
+	RainIntensityMmh string `firestore:"rainIntensityMmh"`
 }
 
 // SSEConnection represents an active SSE connection
@@ -344,7 +351,6 @@ func (app *Application) sendSSEMessage(conn *SSEConnection, message string) {
 	default:
 		fmt.Fprintf(conn.Writer, "data: %s\n\n", message)
 		conn.Writer.Flush()
-
 	}
 }
 
