@@ -136,15 +136,16 @@ func (s *SQLiteStorage) Close() error {
 
 // User represents a user document from Firestore
 type User struct {
-	ID         string   `firestore:"id"`
-	APIKeyHash string   `firestore:"apiKeyHash"`
-	Devices    []Device `firestore:"devices"`
+	ID         string            `firestore:"id"`
+	APIKeyHash string            `firestore:"apiKeyHash"`
+	Devices    map[string]Device `firestore:"devices"`
 }
 
 type Device struct {
-	ID               string `firestore:"id"`
-	RainDetected     string `firestore:"rainDetected"`
-	RainIntensityMmh string `firestore:"rainIntensityMmh"`
+	ID               string  `firestore:"id" json:"id"`
+	FriendlyName     string  `firestore:"friendlyName" json:"friendlyName"`
+	RainDetected     bool    `firestore:"rainDetected" json:"rainDetected"`
+	RainIntensityMmh float32 `firestore:"rainIntensityMmh" json:"rainIntensityMmh"`
 }
 
 // SSEConnection represents an active SSE connection
@@ -232,11 +233,11 @@ func (app *Application) InitFirestore(ctx context.Context, projectID, credential
 	}
 
 	app.firestoreClient = client
-	return app.loadUserAPIKeys(ctx)
+	return app.hydrateCaches(ctx)
 }
 
-// Load user API keys from Firestore
-func (app *Application) loadUserAPIKeys(ctx context.Context) error {
+// Load user API keys and user latest updates from Firestore into memory
+func (app *Application) hydrateCaches(ctx context.Context) error {
 	iter := app.firestoreClient.Collection("users").Documents(ctx)
 	defer iter.Stop()
 
@@ -254,6 +255,18 @@ func (app *Application) loadUserAPIKeys(ctx context.Context) error {
 		}
 
 		app.userAPIKeys[user.APIKeyHash] = user.ID
+
+		key := fmt.Sprintf("user:%s:latest", user.ID)
+		jsonDevices, err := json.Marshal(user.Devices)
+		if err != nil {
+			log.Printf("Error marshalling devices for user %s: %v", user.ID, err)
+			continue
+		}
+		value := fmt.Sprintf(`{"devices": %s}`, string(jsonDevices))
+		if err := app.storage.Set(ctx, key, value); err != nil {
+			log.Printf("Error storing message for user %s: %v", user.ID, err)
+			continue
+		}
 	}
 
 	log.Printf("Loaded %d user API keys", len(app.userAPIKeys))
@@ -460,17 +473,12 @@ func (app *Application) HandleGetLatestMessage(c *gin.Context) {
 
 	// Try to parse as JSON, otherwise return as string
 	var jsonData interface{}
-	if err := json.Unmarshal([]byte(message), &jsonData); err == nil {
-		c.JSON(http.StatusOK, gin.H{
-			"message":   jsonData,
-			"timestamp": time.Now().Unix(),
-		})
-	} else {
-		c.JSON(http.StatusOK, gin.H{
-			"message":   message,
-			"timestamp": time.Now().Unix(),
-		})
+	if err := json.Unmarshal([]byte(message), &jsonData); err != nil {
+		c.JSON(http.StatusOK, gin.H{})
+		return
 	}
+	c.JSON(http.StatusOK, jsonData)
+
 }
 
 // Health check endpoint
