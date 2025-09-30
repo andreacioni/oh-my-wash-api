@@ -1,6 +1,6 @@
 module github.com/andreacioni/oh-my-wash-api
 
-go 1.25.1
+go 1.25.0
 
 require (
 	cloud.google.com/go/firestore v1.18.0
