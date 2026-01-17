@@ -1,171 +1,95 @@
-# SSE PubSub Application Setup Guide
+# Oh My Wash! API
 
-## Features
+This is the official API for the "Oh My Wash!" application. This API is designed to be used by users who have activated the "REST API notification" feature within the application and have obtained an API Key.
 
-✅ **SSE Notifications**: Real-time Server-Sent Events for instant message delivery  
-✅ **GCP Pub/Sub Integration**: Dedicated queue per user with automatic subscription management  
-✅ **Pluggable Storage**: Seamlessly switch between Redis, SQLite, or in-memory storage  
-✅ **Firestore Authentication**: API key-based user authentication with hash verification  
-✅ **Connection Management**: Prevents simultaneous SSE connections from the same user  
-✅ **Rate Limiting**: API endpoint limited to 1 request per minute per user  
-✅ **Auto-Reconnection**: Handles connection drops gracefully  
+## Architecture
 
-## Prerequisites
+The data provided by this API originates from **Google Cloud Pub/Sub**. When one of your "Oh My Wash!" devices changes its status (e.g., detects rain), it publishes a message to a user-specific Pub/Sub topic. This API listens for new messages on that topic. Upon receiving a message, it caches the latest device information, making it available for you to query.
 
-1. **GCP Project** with Pub/Sub and Firestore APIs enabled
-2. **Service Account** with appropriate permissions:
-   - Pub/Sub Admin (for creating topics/subscriptions)
-   - Firestore User (for reading user documents)
-3. **Redis Server** (if using Redis storage)
+## API Integration
 
-## Environment Variables
+To integrate with the API, you must include your unique API Key in the `X-API-Key` HTTP header for every request.
 
-```bash
-# Required
-export GCP_PROJECT_ID="your-gcp-project-id"
+There are two primary endpoints available for you to use:
 
-# Optional
-export STORAGE_TYPE="redis"  # Options: redis, sqlite, memory
-export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account.json"
-export PORT="8080"
-```
+### 1. Get Latest Device Status (REST)
 
-## Firestore Setup
+This endpoint allows you to fetch the most recent status of all your registered devices at once.
 
-Create a `users` collection in Firestore with documents structured like:
+*   **Endpoint:** `GET /api/latest`
+*   **Input:** Your API key must be provided in the `X-API-Key` header.
+*   **Output Example (`200 OK`):** A JSON object containing your devices.
 
-```json
-{
-  "id": "user123",
-  "api_key_hash": "sha256_hash_of_api_key"
-}
-```
+    ```json
+    {
+      "devices": {
+        "device_id_1": {
+          "id": "device_id_1",
+          "friendlyName": "Garden Sprinkler",
+          "rainDetected": true,
+          "rainIntensityMmh": 1.2
+        },
+        "device_id_2": {
+          "id": "device_id_2",
+          "friendlyName": "Front Yard",
+          "rainDetected": false,
+          "rainIntensityMmh": 0
+        }
+      }
+    }
+    ```
 
-To generate an API key hash:
-```go
-import (
-    "crypto/sha256"
-    "encoding/hex"
-)
+### 2. Real-Time Updates (Server-Sent Events)
 
-hash := sha256.Sum256([]byte("your-api-key"))
-apiKeyHash := hex.EncodeToString(hash[:])
-```
+This endpoint provides a persistent connection that streams updates to you in real-time as they happen. This is the most efficient way to get immediate notifications.
 
-## Installation & Running
+*   **Endpoint:** `GET /api/sse`
+*   **Input:** Your API key must be provided in the `X-API-Key` header.
+*   **Output Example:** A stream of `text/event-stream` data. Each event corresponds to a device status update.
 
-```bash
-# Initialize Go module
-go mod init sse-pubsub-app
-go mod tidy
+    ```
+    data: {"devices": {"device_id_1": {"id": "device_id_1", "friendlyName": "Garden Sprinkler", "rainDetected": true, "rainIntensityMmh": 2.5}}}
 
-# Install dependencies
-go get cloud.google.com/go/firestore
-go get cloud.google.com/go/pubsub  
-go get github.com/gin-gonic/gin
-go get github.com/go-redis/redis/v8
-go get github.com/mattn/go-sqlite3
-go get golang.org/x/time/rate
-go get google.golang.org/api/option
+    : keepalive
 
-# Run the application
-go run main.go
-```
+    data: {"devices": {"device_id_1": {"id": "device_id_1", "friendlyName": "Garden Sprinkler", "rainDetected": false, "rainIntensityMmh": 0}}}
+    ```
 
-## API Endpoints
+## Limitations
 
-### 1. SSE Endpoint
-```bash
-curl -H "X-API-Key: your-api-key" http://localhost:8080/api/sse
-```
-- **Purpose**: Establishes Server-Sent Events connection
-- **Behavior**: 
-  - Immediately sends latest cached message
-  - Prevents multiple simultaneous connections per user  
-  - Keeps connection alive with heartbeats
+To ensure the stability and fair use of the service, the API enforces a rate limit. Each user is permitted to make **1 request per second** to the `/api/latest` endpoint. If you exceed this limit, you will receive a `429 Too Many Requests` error.
 
-### 2. Latest Message API
-```bash
-curl -H "X-API-Key: your-api-key" http://localhost:8080/api/latest
-```
-- **Purpose**: Retrieves the most recent message
-- **Rate Limit**: 1 request per minute per user
-- **Response**: JSON with message content and timestamp
+There is no rate limit on the `/api/sse` endpoint, but only one active connection is allowed per user.
 
-### 3. Health Check
-```bash
-curl http://localhost:8080/health
-```
-- **Purpose**: Service health monitoring
-- **No authentication required**
+## Build Instructions
 
-## Storage Options
+To build and run this project from the source code, you will need to have Go installed.
 
-### Redis (Default)
-```bash
-export STORAGE_TYPE="redis"
-# Requires Redis server running on localhost:6379
-```
+1.  **Clone the repository:**
+    ```bash
+    git clone https://github.com/your-username/oh-my-wash-api.git
+    cd oh-my-wash-api
+    ```
 
-### SQLite
-```bash
-export STORAGE_TYPE="sqlite"  
-# Creates cache.db file automatically
-```
+2.  **Install dependencies:**
+    This command will download the necessary Go modules.
+    ```bash
+    go mod tidy
+    ```
 
-### In-Memory
-```bash
-export STORAGE_TYPE="memory"
-# No persistence, data lost on restart
-```
+3.  **Build the application:**
+    This will compile the source code into a single executable file.
+    ```bash
+    go build -o oh-my-wash-api main.go
+    ```
 
-## Pub/Sub Topic/Subscription Naming Convention
+4.  **Run the application:**
+    Before running, you must configure the required environment variables.
+    ```bash
+    export STORAGE_TYPE=memory
+    export GCP_PROJECT_ID=<your-gcp-project-id>
+    export GOOGLE_APPLICATION_CREDENTIALS=/path/to/your/credentials.json
+    export PORT=8080 # This is optional and defaults to 8080
 
-- **Topic**: `user-{userID}-topic`
-- **Subscription**: `user-{userID}-subscription`
-
-The application automatically creates topics and subscriptions if they don't exist.
-
-## Architecture Flow
-
-1. **Startup**: Load user API key hashes from Firestore into memory
-2. **Pub/Sub Setup**: Create subscriptions for all users and start listeners
-3. **Message Handling**: 
-   - Receive message from Pub/Sub
-   - Store in cache (Redis/SQLite/Memory)
-   - Forward to active SSE connection (if any)
-4. **Client Connection**:
-   - Authenticate via API key
-   - Establish SSE connection
-   - Receive latest cached message immediately
-   - Get real-time updates as they arrive
-
-## Testing with Sample Messages
-
-Send a message to a user's Pub/Sub topic:
-
-```bash
-# Using gcloud CLI
-gcloud pubsub topics publish user-user123-topic --message="Hello World"
-```
-
-The message will be:
-1. Received by the application
-2. Stored in the configured cache
-3. Sent to the user's SSE connection (if active)
-4. Available via the `/api/latest` endpoint
-
-## Production Considerations
-
-- **Load Balancing**: Use sticky sessions for SSE connections
-- **Monitoring**: Add metrics for connection counts, message rates
-- **Security**: Use HTTPS and validate API keys regularly  
-- **Scaling**: Consider Redis Cluster for high availability
-- **Error Handling**: Add exponential backoff for Pub/Sub reconnections
-
-## Troubleshooting
-
-- **"Invalid API key"**: Ensure API key hash matches Firestore document
-- **"No message found"**: User hasn't received any Pub/Sub messages yet
-- **SSE connection drops**: Check network stability and firewall settings
-- **Rate limit exceeded**: Wait 1 minute between `/api/latest` requests
+    ./oh-my-wash-api
+    ```
