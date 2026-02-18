@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/go-redis/redis/v8"
 	_ "github.com/mattn/go-sqlite3"
 	"golang.org/x/time/rate"
+	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 )
 
@@ -136,9 +138,17 @@ func (s *SQLiteStorage) Close() error {
 
 // User represents a user document from Firestore
 type User struct {
-	ID         string            `firestore:"id"`
-	APIKeyHash string            `firestore:"apiKeyHash"`
-	Devices    map[string]Device `firestore:"devices"`
+	ID                   string                         `firestore:"id"`
+	Devices              map[string]Device              `firestore:"devices"`
+	NotificationChannels map[string]NotificationChannel `firestore:"notificationChannels"`
+}
+
+type NotificationChannel struct {
+	ID                 string `firestore:"id"`
+	Type               string `firestore:"type"`
+	APIKeyHash         string `firestore:"apiKeyHash"`
+	Status             string `firestore:"status"`
+	LastTokenGenerated string `firestore:"lastTokenGenerated,omitempty"` // omitempty for rest_1 only
 }
 
 type Device struct {
@@ -167,34 +177,34 @@ func NewRateLimiter() *RateLimiter {
 	}
 }
 
-func (rl *RateLimiter) GetLimiter(userID string) *rate.Limiter {
+func (rl *RateLimiter) GetLimiter(key string) *rate.Limiter {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
-	limiter, exists := rl.limiters[userID]
+	limiter, exists := rl.limiters[key]
 	if !exists {
 		limiter = rate.NewLimiter(rate.Every(time.Second), 1) // 1 request per second
-		rl.limiters[userID] = limiter
+		rl.limiters[key] = limiter
 	}
 	return limiter
 }
 
 // Application struct holds all dependencies
 type Application struct {
-	storage         Storage
-	pubsubClient    *pubsub.Client
-	firestoreClient *firestore.Client
-	userAPIKeys     map[string]string         // apiKeyHash -> userID
-	sseConnections  map[string]*SSEConnection // userID -> connection
-	connMutex       sync.RWMutex
-	rateLimiter     *RateLimiter
+	storage             Storage
+	pubsubClient        *pubsub.Client
+	firestoreClient     *firestore.Client
+	sseConnections      map[string]*SSEConnection // userID -> connection
+	connMutex           sync.RWMutex
+	userIdRateLimiter   *RateLimiter
+	clientIpRateLimiter *RateLimiter
 }
 
 func NewApplication() *Application {
 	return &Application{
-		userAPIKeys:    make(map[string]string),
-		sseConnections: make(map[string]*SSEConnection),
-		rateLimiter:    NewRateLimiter(),
+		sseConnections:      make(map[string]*SSEConnection),
+		userIdRateLimiter:   NewRateLimiter(),
+		clientIpRateLimiter: NewRateLimiter(),
 	}
 }
 
@@ -217,7 +227,7 @@ func (app *Application) InitStorage(storageType string) error {
 	return nil
 }
 
-// Initialize Firestore client and load user API keys
+// Initialize Firestore client
 func (app *Application) InitFirestore(ctx context.Context, projectID, credentialsFile string) error {
 	var client *firestore.Client
 	var err error
@@ -233,43 +243,6 @@ func (app *Application) InitFirestore(ctx context.Context, projectID, credential
 	}
 
 	app.firestoreClient = client
-	return app.hydrateCaches(ctx)
-}
-
-// Load user API keys and user latest updates from Firestore into memory
-func (app *Application) hydrateCaches(ctx context.Context) error {
-	iter := app.firestoreClient.Collection("users").Documents(ctx)
-	defer iter.Stop()
-
-	for {
-		doc, err := iter.Next()
-		if err != nil {
-			log.Printf("Error iterating user documents: %v", err)
-			break
-		}
-
-		var user User
-		if err := doc.DataTo(&user); err != nil {
-			log.Printf("Error unmarshalling user document: %v", err)
-			continue
-		}
-
-		app.userAPIKeys[user.APIKeyHash] = user.ID
-
-		key := fmt.Sprintf("user:%s:latest", user.ID)
-		jsonDevices, err := json.Marshal(user.Devices)
-		if err != nil {
-			log.Printf("Error marshalling devices for user %s: %v", user.ID, err)
-			continue
-		}
-		value := fmt.Sprintf(`{"devices": %s}`, string(jsonDevices))
-		if err := app.storage.Set(ctx, key, value); err != nil {
-			log.Printf("Error storing message for user %s: %v", user.ID, err)
-			continue
-		}
-	}
-
-	log.Printf("Loaded %d user API keys", len(app.userAPIKeys))
 	return nil
 }
 
@@ -294,15 +267,36 @@ func (app *Application) InitPubSub(ctx context.Context, projectID, credentialsFi
 
 // Start Pub/Sub subscriptions for all users
 func (app *Application) StartPubSubSubscriptions(ctx context.Context) {
-	for _, userID := range app.userAPIKeys {
+	query := app.firestoreClient.Collection("users").
+		Where("notificationChannels.rest_1.status", "==", "active").
+		Where("notificationChannels.rest_1.apiKeyHash", ">", "") // Checks for non-empty apiKeyHash
+
+	iter := query.Documents(ctx)
+	defer iter.Stop()
+
+	i := 0
+
+	for {
+		doc, err := iter.Next()
+		if err != nil {
+			if err == iterator.Done {
+				break
+			}
+			log.Printf("Error iterating user documents to start Pub/Sub subscriptions: %v", err)
+			return
+		}
+		userID := doc.Ref.ID
 		go app.subscribePubSub(ctx, userID)
+		i++
 	}
+
+	log.Printf("Started Pub/Sub subscriptions for %d users", i)
 }
 
 // Subscribe to Pub/Sub messages for a specific user
 func (app *Application) subscribePubSub(ctx context.Context, userID string) {
 	subscriptionName := fmt.Sprintf("%s-sub", userID)
-
+	log.Printf("Ensuring Pub/Sub subscription %s exists", subscriptionName)
 	subscription := app.pubsubClient.Subscription(subscriptionName)
 
 	// Check if subscription exists, create if not
@@ -313,8 +307,14 @@ func (app *Application) subscribePubSub(ctx context.Context, userID string) {
 	}
 
 	if !exists {
-		topicName := fmt.Sprintf("projects/oh-my-wash-45358/topics/%s", userID)
-		topic := app.pubsubClient.Topic(topicName)
+		log.Printf("Subscription %s does not exist for user %s, creating...", subscriptionName, userID)
+		topicName := fmt.Sprintf("users_%s", userID) //prefix for this topic is already added by the client library
+		topic := app.getOrCreateTopic(ctx, topicName)
+
+		if topic == nil {
+			log.Printf("Failed to get or create topic %s for user %s", topicName, userID)
+			return
+		}
 
 		// Create subscription
 		_, err = app.pubsubClient.CreateSubscription(ctx, subscriptionName, pubsub.SubscriptionConfig{
@@ -324,9 +324,13 @@ func (app *Application) subscribePubSub(ctx context.Context, userID string) {
 			log.Printf("Error creating subscription for user %s: %v", userID, err)
 			return
 		}
+
+		log.Printf("Created Pub/Sub subscription %s for user %s", subscriptionName, userID)
+	} else {
+		log.Printf("Subscription %s already exists for user %s", subscriptionName, userID)
 	}
 
-	// Start receiving messages
+	log.Printf("Starting to receive Pub/Sub messages for user %s on subscription %s", userID, subscriptionName)
 	err = subscription.Receive(ctx, func(ctx context.Context, msg *pubsub.Message) {
 		app.handlePubSubMessage(ctx, userID, string(msg.Data))
 		msg.Ack()
@@ -335,6 +339,27 @@ func (app *Application) subscribePubSub(ctx context.Context, userID string) {
 	if err != nil {
 		log.Printf("Error receiving Pub/Sub messages for user %s: %v", userID, err)
 	}
+}
+
+// Get or create Pub/Sub topic
+func (app *Application) getOrCreateTopic(ctx context.Context, topicName string) *pubsub.Topic {
+	topic := app.pubsubClient.Topic(topicName)
+	exists, err := topic.Exists(ctx)
+	if err != nil {
+		log.Printf("Error checking topic existence: %v", err)
+		return nil
+	}
+
+	if !exists {
+		topic, err = app.pubsubClient.CreateTopic(ctx, topicName)
+		if err != nil {
+			log.Printf("Error creating topic %s: %v", topicName, err)
+			return nil
+		}
+		log.Printf("Created Pub/Sub topic %s", topicName)
+	}
+
+	return topic
 }
 
 // Handle incoming Pub/Sub message
@@ -377,19 +402,74 @@ func (app *Application) AuthMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		// Hash the API key
-		hash := sha256.Sum256([]byte(apiKey))
-		apiKeyHash := hex.EncodeToString(hash[:])
+		parsedUserID, _, err := parseAPIKey(apiKey)
+		if err != nil {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid API key format"})
+			c.Abort()
+			return
+		}
 
-		// Look up user ID
-		userID, exists := app.userAPIKeys[apiKeyHash]
-		if !exists {
+		userDoc, err := app.firestoreClient.Collection("users").Doc(parsedUserID).Get(c.Request.Context())
+		if err != nil {
+			log.Printf("Error getting user document for %s: %v", parsedUserID, err)
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid API key"})
 			c.Abort()
 			return
 		}
 
-		c.Set("userID", userID)
+		var user User
+		if err := userDoc.DataTo(&user); err != nil {
+			log.Printf("Error unmarshalling user document for %s: %v", parsedUserID, err)
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid API key"})
+			c.Abort()
+			return
+		}
+
+		// Hash the actual key
+		hash := sha256.Sum256([]byte(apiKey))
+		actualKeyHash := hex.EncodeToString(hash[:])
+
+		authenticated := false
+		for _, channel := range user.NotificationChannels {
+			if channel.Type == "restApi" && channel.APIKeyHash == actualKeyHash {
+				authenticated = true
+				break
+			}
+		}
+
+		if !authenticated {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid API key"})
+			c.Abort()
+			return
+		}
+
+		// If user is authenticated and has an active rest_1 channel with an API key hash,
+		// ensure their Pub/Sub subscription is active.
+		restChannel, ok := user.NotificationChannels["rest_1"]
+		if ok && restChannel.Status == "active" && restChannel.APIKeyHash != "" {
+			go app.subscribePubSub(c.Request.Context(), parsedUserID)
+		}
+
+		c.Set("userID", parsedUserID)
+		c.Next()
+	}
+}
+
+// Middleware to rate limit API requests by IP address
+func (app *Application) IpRateLimitMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		ip := c.ClientIP()
+
+		// Apply rate limiting
+		limiter := app.clientIpRateLimiter.GetLimiter(ip)
+		if !limiter.Allow() {
+			c.JSON(http.StatusTooManyRequests, gin.H{
+				"error": "Rate limit exceeded. Try again later.",
+			})
+			c.Abort()
+			return
+		}
+
 		c.Next()
 	}
 }
@@ -453,7 +533,7 @@ func (app *Application) HandleGetLatestMessage(c *gin.Context) {
 	userID := c.GetString("userID")
 
 	// Apply rate limiting
-	limiter := app.rateLimiter.GetLimiter(userID)
+	limiter := app.userIdRateLimiter.GetLimiter(userID)
 	if !limiter.Allow() {
 		c.JSON(http.StatusTooManyRequests, gin.H{
 			"error": "Rate limit exceeded. Try again later.",
@@ -466,7 +546,7 @@ func (app *Application) HandleGetLatestMessage(c *gin.Context) {
 	message, err := app.storage.Get(c.Request.Context(), key)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{
-			"error": "No message found for user",
+			"error": "No recent data found for user",
 		})
 		return
 	}
@@ -534,6 +614,7 @@ func main() {
 
 	// Protected endpoints
 	api := r.Group("/api")
+	api.Use(app.IpRateLimitMiddleware())
 	api.Use(app.AuthMiddleware())
 	{
 		api.GET("/sse", app.HandleSSE)
@@ -542,7 +623,6 @@ func main() {
 
 	// Start server
 	log.Printf("Starting server on port %s with storage type: %s", port, storageType)
-	log.Printf("Loaded %d users", len(app.userAPIKeys))
 
 	if err := r.Run(":" + port); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
@@ -555,4 +635,18 @@ func getEnv(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+// parseAPIKey extracts the userID and actual key from the provided API key string.
+// The format is "ug.<userID_base64_encoded>.<actualKey>".
+func parseAPIKey(apiKey string) (string, string, error) {
+	parts := strings.Split(apiKey, ".")
+	if len(parts) != 3 || parts[0] != "ug" {
+		return "", "", fmt.Errorf("invalid API key format")
+	}
+
+	userID := parts[1]
+	actualKey := parts[2]
+
+	return string(userID), actualKey, nil
 }
