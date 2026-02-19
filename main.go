@@ -27,6 +27,7 @@ import (
 // Storage interface for pluggable cache mechanisms
 type Storage interface {
 	Set(ctx context.Context, key string, value string) error
+	AppendMap(ctx context.Context, key string, mapKey string, value any) (map[string]any, error)
 	Get(ctx context.Context, key string) (string, error)
 	Close() error
 }
@@ -43,6 +44,10 @@ func NewRedisStorage(addr, password string, db int) *RedisStorage {
 		DB:       db,
 	})
 	return &RedisStorage{client: rdb}
+}
+
+func (m *RedisStorage) AppendMap(ctx context.Context, key string, mapKey string, value any) (map[string]any, error) {
+	return nil, fmt.Errorf("AppendMap not implemented for RedisStorage")
 }
 
 func (r *RedisStorage) Set(ctx context.Context, key string, value string) error {
@@ -86,6 +91,27 @@ func (m *MemoryStorage) Get(ctx context.Context, key string) (string, error) {
 	return value, nil
 }
 
+func (m *MemoryStorage) AppendMap(ctx context.Context, key string, mapKey string, value any) (map[string]any, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, exists := m.data[key]; !exists {
+		m.data[key] = "{}"
+	}
+	var existingMap map[string]any
+	if err := json.Unmarshal([]byte(m.data[key]), &existingMap); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal existing value: %v", err)
+	}
+	existingMap[mapKey] = value
+
+	updatedValue, err := json.Marshal(existingMap)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal updated map: %v", err)
+	}
+
+	m.data[key] = string(updatedValue)
+	return existingMap, nil
+}
+
 func (m *MemoryStorage) Close() error {
 	return nil
 }
@@ -121,6 +147,10 @@ func (s *SQLiteStorage) Set(ctx context.Context, key string, value string) error
 		"INSERT OR REPLACE INTO cache (key, value, updated_at) VALUES (?, ?, ?)",
 		key, value, time.Now())
 	return err
+}
+
+func (m *SQLiteStorage) AppendMap(ctx context.Context, key string, mapKey string, value any) (map[string]any, error) {
+	return nil, fmt.Errorf("AppendMap not implemented for SQLiteStorage")
 }
 
 func (s *SQLiteStorage) Get(ctx context.Context, key string) (string, error) {
@@ -196,8 +226,8 @@ type Application struct {
 	firestoreClient *firestore.Client
 	sseConnections  map[string]*SSEConnection // userID -> connection
 	connMutex       sync.RWMutex
-	// subMu protects activeSubscriptions
-	subMu sync.Mutex
+	// subMutex protects activeSubscriptions
+	subMutex sync.Mutex
 	// activeSubscriptions tracks running Pub/Sub receivers per user
 	activeSubscriptions map[string]context.CancelFunc
 	userIdRateLimiter   *RateLimiter
@@ -292,7 +322,7 @@ func (app *Application) StartPubSubSubscriptions(ctx context.Context) {
 		}
 		userID := doc.Ref.ID
 		// subscribePubSub is now non-blocking and idempotent per user
-		app.subscribePubSub(ctx, userID)
+		app.subscribePubSub(userID)
 		i++
 	}
 
@@ -300,27 +330,27 @@ func (app *Application) StartPubSubSubscriptions(ctx context.Context) {
 }
 
 // Subscribe to Pub/Sub messages for a specific user
-func (app *Application) subscribePubSub(ctx context.Context, userID string) {
+func (app *Application) subscribePubSub(userID string) {
 	// Ensure only one receiver goroutine exists per user
-	app.subMu.Lock()
+	app.subMutex.Lock()
 	if _, exists := app.activeSubscriptions[userID]; exists {
-		app.subMu.Unlock()
+		app.subMutex.Unlock()
 		return
 	}
 	// reserve slot and create cancel func
 	ctxReceiver, cancel := context.WithCancel(context.Background())
 	app.activeSubscriptions[userID] = cancel
-	app.subMu.Unlock()
+	app.subMutex.Unlock()
 
 	// Start subscription handling in a separate goroutine so caller is non-blocking
 	go func() {
 		defer func() {
-			app.subMu.Lock()
+			app.subMutex.Lock()
 			if _, ok := app.activeSubscriptions[userID]; ok {
 				// remove active mark when receiver stops
 				delete(app.activeSubscriptions, userID)
 			}
-			app.subMu.Unlock()
+			app.subMutex.Unlock()
 		}()
 
 		subscriptionName := fmt.Sprintf("%s-sub", userID)
@@ -395,7 +425,14 @@ func (app *Application) getOrCreateTopic(ctx context.Context, topicName string) 
 func (app *Application) handlePubSubMessage(ctx context.Context, userID, message string) {
 	// Store message in cache
 	key := fmt.Sprintf("user:%s:latest", userID)
-	if err := app.storage.Set(ctx, key, message); err != nil {
+	deviceMap := make(map[string]any)
+
+	if err := json.Unmarshal([]byte(message), &deviceMap); err != nil {
+		log.Printf("Error unmarshalling Pub/Sub message for user %s: %v", userID, err)
+		return
+	}
+
+	if _, err := app.storage.AppendMap(ctx, key, deviceMap["deviceId"].(string), deviceMap); err != nil {
 		log.Printf("Error storing message for user %s: %v", userID, err)
 		return
 	}
@@ -476,7 +513,7 @@ func (app *Application) AuthMiddleware() gin.HandlerFunc {
 		// ensure their Pub/Sub subscription is active.
 		restChannel, ok := user.NotificationChannels["rest_1"]
 		if ok && restChannel.Status == "active" && restChannel.APIKeyHash != "" {
-			app.subscribePubSub(c.Request.Context(), parsedUserID)
+			app.subscribePubSub(parsedUserID)
 		}
 
 		c.Set("userID", parsedUserID)
