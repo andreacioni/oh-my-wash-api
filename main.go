@@ -191,11 +191,15 @@ func (rl *RateLimiter) GetLimiter(key string) *rate.Limiter {
 
 // Application struct holds all dependencies
 type Application struct {
-	storage             Storage
-	pubsubClient        *pubsub.Client
-	firestoreClient     *firestore.Client
-	sseConnections      map[string]*SSEConnection // userID -> connection
-	connMutex           sync.RWMutex
+	storage         Storage
+	pubsubClient    *pubsub.Client
+	firestoreClient *firestore.Client
+	sseConnections  map[string]*SSEConnection // userID -> connection
+	connMutex       sync.RWMutex
+	// subMu protects activeSubscriptions
+	subMu sync.Mutex
+	// activeSubscriptions tracks running Pub/Sub receivers per user
+	activeSubscriptions map[string]context.CancelFunc
 	userIdRateLimiter   *RateLimiter
 	clientIpRateLimiter *RateLimiter
 }
@@ -203,6 +207,7 @@ type Application struct {
 func NewApplication() *Application {
 	return &Application{
 		sseConnections:      make(map[string]*SSEConnection),
+		activeSubscriptions: make(map[string]context.CancelFunc),
 		userIdRateLimiter:   NewRateLimiter(),
 		clientIpRateLimiter: NewRateLimiter(),
 	}
@@ -286,7 +291,8 @@ func (app *Application) StartPubSubSubscriptions(ctx context.Context) {
 			return
 		}
 		userID := doc.Ref.ID
-		go app.subscribePubSub(ctx, userID)
+		// subscribePubSub is now non-blocking and idempotent per user
+		app.subscribePubSub(ctx, userID)
 		i++
 	}
 
@@ -295,50 +301,73 @@ func (app *Application) StartPubSubSubscriptions(ctx context.Context) {
 
 // Subscribe to Pub/Sub messages for a specific user
 func (app *Application) subscribePubSub(ctx context.Context, userID string) {
-	subscriptionName := fmt.Sprintf("%s-sub", userID)
-	log.Printf("Ensuring Pub/Sub subscription %s exists", subscriptionName)
-	subscription := app.pubsubClient.Subscription(subscriptionName)
-
-	// Check if subscription exists, create if not
-	exists, err := subscription.Exists(ctx)
-	if err != nil {
-		log.Printf("Error checking subscription existence for user %s: %v", userID, err)
+	// Ensure only one receiver goroutine exists per user
+	app.subMu.Lock()
+	if _, exists := app.activeSubscriptions[userID]; exists {
+		app.subMu.Unlock()
 		return
 	}
+	// reserve slot and create cancel func
+	ctxReceiver, cancel := context.WithCancel(context.Background())
+	app.activeSubscriptions[userID] = cancel
+	app.subMu.Unlock()
 
-	if !exists {
-		log.Printf("Subscription %s does not exist for user %s, creating...", subscriptionName, userID)
-		topicName := fmt.Sprintf("users_%s", userID) //prefix for this topic is already added by the client library
-		topic := app.getOrCreateTopic(ctx, topicName)
+	// Start subscription handling in a separate goroutine so caller is non-blocking
+	go func() {
+		defer func() {
+			app.subMu.Lock()
+			if _, ok := app.activeSubscriptions[userID]; ok {
+				// remove active mark when receiver stops
+				delete(app.activeSubscriptions, userID)
+			}
+			app.subMu.Unlock()
+		}()
 
-		if topic == nil {
-			log.Printf("Failed to get or create topic %s for user %s", topicName, userID)
-			return
-		}
+		subscriptionName := fmt.Sprintf("%s-sub", userID)
+		log.Printf("Ensuring Pub/Sub subscription %s exists", subscriptionName)
+		subscription := app.pubsubClient.Subscription(subscriptionName)
 
-		// Create subscription
-		_, err = app.pubsubClient.CreateSubscription(ctx, subscriptionName, pubsub.SubscriptionConfig{
-			Topic: topic,
-		})
+		// Check if subscription exists, create if not
+		exists, err := subscription.Exists(ctxReceiver)
 		if err != nil {
-			log.Printf("Error creating subscription for user %s: %v", userID, err)
+			log.Printf("Error checking subscription existence for user %s: %v", userID, err)
 			return
 		}
 
-		log.Printf("Created Pub/Sub subscription %s for user %s", subscriptionName, userID)
-	} else {
-		log.Printf("Subscription %s already exists for user %s", subscriptionName, userID)
-	}
+		if !exists {
+			log.Printf("Subscription %s does not exist for user %s, creating...", subscriptionName, userID)
+			topicName := fmt.Sprintf("users_%s", userID) // prefix for this topic is already added by the client library
+			topic := app.getOrCreateTopic(ctxReceiver, topicName)
 
-	log.Printf("Starting to receive Pub/Sub messages for user %s on subscription %s", userID, subscriptionName)
-	err = subscription.Receive(ctx, func(ctx context.Context, msg *pubsub.Message) {
-		app.handlePubSubMessage(ctx, userID, string(msg.Data))
-		msg.Ack()
-	})
+			if topic == nil {
+				log.Printf("Failed to get or create topic %s for user %s", topicName, userID)
+				return
+			}
 
-	if err != nil {
-		log.Printf("Error receiving Pub/Sub messages for user %s: %v", userID, err)
-	}
+			// Create subscription
+			_, err = app.pubsubClient.CreateSubscription(ctxReceiver, subscriptionName, pubsub.SubscriptionConfig{
+				Topic: topic,
+			})
+			if err != nil {
+				log.Printf("Error creating subscription for user %s: %v", userID, err)
+				return
+			}
+
+			log.Printf("Created Pub/Sub subscription %s for user %s", subscriptionName, userID)
+		} else {
+			log.Printf("Subscription %s already exists for user %s", subscriptionName, userID)
+		}
+
+		log.Printf("Starting to receive Pub/Sub messages for user %s on subscription %s", userID, subscriptionName)
+		err = subscription.Receive(ctxReceiver, func(ctx context.Context, msg *pubsub.Message) {
+			app.handlePubSubMessage(ctx, userID, string(msg.Data))
+			msg.Ack()
+		})
+
+		if err != nil {
+			log.Printf("Error receiving Pub/Sub messages for user %s: %v", userID, err)
+		}
+	}()
 }
 
 // Get or create Pub/Sub topic
@@ -447,7 +476,7 @@ func (app *Application) AuthMiddleware() gin.HandlerFunc {
 		// ensure their Pub/Sub subscription is active.
 		restChannel, ok := user.NotificationChannels["rest_1"]
 		if ok && restChannel.Status == "active" && restChannel.APIKeyHash != "" {
-			go app.subscribePubSub(c.Request.Context(), parsedUserID)
+			app.subscribePubSub(c.Request.Context(), parsedUserID)
 		}
 
 		c.Set("userID", parsedUserID)
@@ -578,6 +607,10 @@ func main() {
 	projectID := getEnv("GCP_PROJECT_ID", "")
 	credentialsFile := getEnv("GOOGLE_APPLICATION_CREDENTIALS", "")
 	port := getEnv("PORT", "8080")
+
+	// Redirect the standard library logger to Gin's default writer so
+	// existing log.Printf / log.Fatalf calls use Gin's logging output.
+	log.SetOutput(gin.DefaultWriter)
 
 	if projectID == "" {
 		log.Fatal("GCP_PROJECT_ID environment variable is required")
