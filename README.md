@@ -18,23 +18,21 @@ This endpoint allows you to fetch the most recent status of all your registered 
 
 *   **Endpoint:** `GET /api/latest`
 *   **Input:** Your API key must be provided in the `X-API-Key` header.
-*   **Output Example (`200 OK`):** A JSON object containing your devices.
+*   **Output Example (`200 OK`):** A JSON object containing your devices, indexed by their unique ID.
 
     ```json
     {
-      "devices": {
-        "device_id_1": {
-          "id": "device_id_1",
-          "friendlyName": "Garden Sprinkler",
-          "rainDetected": true,
-          "rainIntensityMmh": 1.2
-        },
-        "device_id_2": {
-          "id": "device_id_2",
-          "friendlyName": "Front Yard",
-          "rainDetected": false,
-          "rainIntensityMmh": 0
-        }
+      "device_id_1": {
+        "deviceId": "device_id_1",
+        "friendlyName": "Garden Sprinkler",
+        "rainDetected": true,
+        "rainIntensityMmh": 1.2
+      },
+      "device_id_2": {
+        "deviceId": "device_id_2",
+        "friendlyName": "Front Yard",
+        "rainDetected": false,
+        "rainIntensityMmh": 0
       }
     }
     ```
@@ -45,14 +43,14 @@ This endpoint provides a persistent connection that streams updates to you in re
 
 *   **Endpoint:** `GET /api/sse`
 *   **Input:** Your API key must be provided in the `X-API-Key` header.
-*   **Output Example:** A stream of `text/event-stream` data. Each event corresponds to a device status update.
+*   **Output Example:** A stream of `text/event-stream` data. Upon connection, the first event provides the full current state of all registered devices. Subsequent events are sent as individual device updates occur.
 
     ```
-    data: {"devices": {"device_id_1": {"id": "device_id_1", "friendlyName": "Garden Sprinkler", "rainDetected": true, "rainIntensityMmh": 2.5}}}
+    data: {"device_id_1": {"deviceId": "device_id_1", "friendlyName": "Garden Sprinkler", "rainDetected": true, "rainIntensityMmh": 2.5}, "device_id_2": {"deviceId": "device_id_2", "friendlyName": "Front Yard", "rainDetected": false, "rainIntensityMmh": 0}}
 
     : keepalive
 
-    data: {"devices": {"device_id_1": {"id": "device_id_1", "friendlyName": "Garden Sprinkler", "rainDetected": false, "rainIntensityMmh": 0}}}
+    data: {"deviceId": "device_id_1", "friendlyName": "Garden Sprinkler", "rainDetected": false, "rainIntensityMmh": 0}
     ```
 
 ## Limitations
