@@ -346,10 +346,7 @@ func (app *Application) subscribePubSub(userID string) {
 	go func() {
 		defer func() {
 			app.subMutex.Lock()
-			if _, ok := app.activeSubscriptions[userID]; ok {
-				// remove active mark when receiver stops
-				delete(app.activeSubscriptions, userID)
-			}
+			delete(app.activeSubscriptions, userID)
 			app.subMutex.Unlock()
 		}()
 
