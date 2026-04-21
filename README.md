@@ -24,18 +24,24 @@ This endpoint allows you to fetch the most recent status of all your registered 
     {
       "device_id_1": {
         "deviceId": "device_id_1",
-        "friendlyName": "Garden Sprinkler",
-        "rainDetected": true,
-        "rainIntensityMmh": 1.2
+        "deviceName": "Dev1",
+        "deviceType": "manual",
+        "productDate": 1776723000000,
+        "productType": "SRI",
+        "rainIntensityMmh": 2.40
       },
       "device_id_2": {
         "deviceId": "device_id_2",
-        "friendlyName": "Front Yard",
-        "rainDetected": false,
-        "rainIntensityMmh": 0
+        "deviceName": "Dev2",
+        "deviceType": "android",
+        "productDate": 1776173100000,
+        "productType": "SRI",
+        "rainIntensityMmh": 1.20
       }
     }
     ```
+
+⚠️ Device are removed from this list when `now()` > `productDate` + `15 minutes`
 
 ### 2. Real-Time Updates (Server-Sent Events)
 
