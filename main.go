@@ -739,7 +739,11 @@ func main() {
 	app.StartPubSubSubscriptions(ctx)
 
 	// Setup Gin router
-	r := gin.Default()
+	r := gin.New()
+	r.Use(gin.Recovery())
+	r.Use(gin.LoggerWithConfig(gin.LoggerConfig{
+		SkipPaths: []string{"/health"},
+	}))
 
 	// Health check endpoint (no auth required)
 	r.GET("/health", app.HandleHealthCheck)
