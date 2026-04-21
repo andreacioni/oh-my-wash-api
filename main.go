@@ -608,9 +608,7 @@ func (app *Application) HandleGetLatestMessage(c *gin.Context) {
 	key := fmt.Sprintf("user:%s:latest", userID)
 	message, err := app.storage.Get(c.Request.Context(), key)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{
-			"error": "No recent data found for user",
-		})
+		c.JSON(http.StatusOK, gin.H{})
 		return
 	}
 
