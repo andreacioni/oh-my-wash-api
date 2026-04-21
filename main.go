@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,7 +28,6 @@ import (
 // Storage interface for pluggable cache mechanisms
 type Storage interface {
 	Set(ctx context.Context, key string, value string) error
-	AppendMap(ctx context.Context, key string, mapKey string, value any) (map[string]any, error)
 	Get(ctx context.Context, key string) (string, error)
 	Close() error
 }
@@ -44,10 +44,6 @@ func NewRedisStorage(addr, password string, db int) *RedisStorage {
 		DB:       db,
 	})
 	return &RedisStorage{client: rdb}
-}
-
-func (m *RedisStorage) AppendMap(ctx context.Context, key string, mapKey string, value any) (map[string]any, error) {
-	return nil, fmt.Errorf("AppendMap not implemented for RedisStorage")
 }
 
 func (r *RedisStorage) Set(ctx context.Context, key string, value string) error {
@@ -91,27 +87,6 @@ func (m *MemoryStorage) Get(ctx context.Context, key string) (string, error) {
 	return value, nil
 }
 
-func (m *MemoryStorage) AppendMap(ctx context.Context, key string, mapKey string, value any) (map[string]any, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if _, exists := m.data[key]; !exists {
-		m.data[key] = "{}"
-	}
-	var existingMap map[string]any
-	if err := json.Unmarshal([]byte(m.data[key]), &existingMap); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal existing value: %v", err)
-	}
-	existingMap[mapKey] = value
-
-	updatedValue, err := json.Marshal(existingMap)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal updated map: %v", err)
-	}
-
-	m.data[key] = string(updatedValue)
-	return existingMap, nil
-}
-
 func (m *MemoryStorage) Close() error {
 	return nil
 }
@@ -147,10 +122,6 @@ func (s *SQLiteStorage) Set(ctx context.Context, key string, value string) error
 		"INSERT OR REPLACE INTO cache (key, value, updated_at) VALUES (?, ?, ?)",
 		key, value, time.Now())
 	return err
-}
-
-func (m *SQLiteStorage) AppendMap(ctx context.Context, key string, mapKey string, value any) (map[string]any, error) {
-	return nil, fmt.Errorf("AppendMap not implemented for SQLiteStorage")
 }
 
 func (s *SQLiteStorage) Get(ctx context.Context, key string) (string, error) {
@@ -219,6 +190,29 @@ func (rl *RateLimiter) GetLimiter(key string) *rate.Limiter {
 	return limiter
 }
 
+// getOrCreateUserMutex returns the mutex for a specific user, creating it if necessary
+func (app *Application) getOrCreateUserMutex(userID string) *sync.Mutex {
+	app.userMutexesMu.RLock()
+	mu, exists := app.userMutexes[userID]
+	app.userMutexesMu.RUnlock()
+
+	if exists {
+		return mu
+	}
+
+	app.userMutexesMu.Lock()
+	defer app.userMutexesMu.Unlock()
+
+	// Double-check after acquiring write lock
+	if mu, exists := app.userMutexes[userID]; exists {
+		return mu
+	}
+
+	mu = &sync.Mutex{}
+	app.userMutexes[userID] = mu
+	return mu
+}
+
 // Application struct holds all dependencies
 type Application struct {
 	storage         Storage
@@ -232,6 +226,10 @@ type Application struct {
 	activeSubscriptions map[string]context.CancelFunc
 	userIdRateLimiter   *RateLimiter
 	clientIpRateLimiter *RateLimiter
+	// userMutexes protects concurrent access to user-specific cache operations
+	userMutexes           map[string]*sync.Mutex
+	userMutexesMu         sync.RWMutex // deviceCacheTTLMinutes is the time-to-live in minutes for cached device data
+	deviceCacheTTLMinutes int64
 }
 
 func NewApplication() *Application {
@@ -240,6 +238,7 @@ func NewApplication() *Application {
 		activeSubscriptions: make(map[string]context.CancelFunc),
 		userIdRateLimiter:   NewRateLimiter(),
 		clientIpRateLimiter: NewRateLimiter(),
+		userMutexes:         make(map[string]*sync.Mutex),
 	}
 }
 
@@ -422,14 +421,73 @@ func (app *Application) getOrCreateTopic(ctx context.Context, topicName string) 
 func (app *Application) handlePubSubMessage(ctx context.Context, userID, message string) {
 	// Store message in cache
 	key := fmt.Sprintf("user:%s:latest", userID)
-	deviceMap := make(map[string]any)
 
-	if err := json.Unmarshal([]byte(message), &deviceMap); err != nil {
+	var incomingDevice map[string]any
+	if err := json.Unmarshal([]byte(message), &incomingDevice); err != nil {
 		log.Printf("Error unmarshalling Pub/Sub message for user %s: %v", userID, err)
 		return
 	}
 
-	if _, err := app.storage.AppendMap(ctx, key, deviceMap["deviceId"].(string), deviceMap); err != nil {
+	// Acquire per-user mutex to prevent concurrent modification of cache data
+	userMu := app.getOrCreateUserMutex(userID)
+	userMu.Lock()
+	defer userMu.Unlock()
+
+	// Get current devices map
+	currentData, err := app.storage.Get(ctx, key)
+	devicesMap := make(map[string]any)
+
+	if err == nil && currentData != "" {
+		if err := json.Unmarshal([]byte(currentData), &devicesMap); err != nil {
+			log.Printf("Error unmarshalling existing devices map for user %s: %v", userID, err)
+		}
+	}
+
+	// Get current time in milliseconds and calculate cutoff time
+	now := time.Now().UnixMilli()
+	cutoffMs := app.deviceCacheTTLMinutes * 60 * 1000
+	cutoffTime := now - cutoffMs
+
+	// Remove entries older than 15 minutes
+	for deviceID, device := range devicesMap {
+		deviceObj, ok := device.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		productDateInterface, ok := deviceObj["productDate"]
+		if !ok {
+			continue
+		}
+
+		var productDate int64
+		switch v := productDateInterface.(type) {
+		case float64:
+			productDate = int64(v)
+		case int64:
+			productDate = v
+		default:
+			continue
+		}
+
+		if productDate < cutoffTime {
+			delete(devicesMap, deviceID)
+		}
+	}
+
+	// Add/update the new device
+	if deviceID, ok := incomingDevice["deviceId"].(string); ok {
+		devicesMap[deviceID] = incomingDevice
+	}
+
+	// Store updated map
+	updatedData, err := json.Marshal(devicesMap)
+	if err != nil {
+		log.Printf("Error marshalling devices map for user %s: %v", userID, err)
+		return
+	}
+
+	if err := app.storage.Set(ctx, key, string(updatedData)); err != nil {
 		log.Printf("Error storing message for user %s: %v", userID, err)
 		return
 	}
@@ -639,6 +697,15 @@ func main() {
 	projectID := getEnv("GCP_PROJECT_ID", "")
 	credentialsFile := getEnv("GOOGLE_APPLICATION_CREDENTIALS", "")
 	port := getEnv("PORT", "8080")
+	deviceCacheTTL := getEnv("DEVICE_CACHE_TTL_MINUTES", "15")
+
+	// Parse device cache TTL
+	ttl, err := parseIntEnv(deviceCacheTTL, 15)
+	if err != nil {
+		log.Printf("Invalid DEVICE_CACHE_TTL_MINUTES value: %v, using default 15 minutes", err)
+		ttl = 15
+	}
+	app.deviceCacheTTLMinutes = int64(ttl)
 
 	// Redirect the standard library logger to Gin's default writer so
 	// existing log.Printf / log.Fatalf calls use Gin's logging output.
@@ -700,6 +767,15 @@ func getEnv(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+// parseIntEnv parses an integer from a string, returning a default on error
+func parseIntEnv(value string, defaultValue int) (int, error) {
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return defaultValue, err
+	}
+	return parsed, nil
 }
 
 // parseAPIKey extracts the userID and actual key from the provided API key string.
