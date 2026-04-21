@@ -41,7 +41,7 @@ This endpoint allows you to fetch the most recent status of all your registered 
     }
     ```
 
-⚠️ Device are removed from this list when `now()` > `productDate` + `15 minutes`
+⚠️ Device are removed from this response when `now()` > `productDate` + `15 minutes`
 
 ### 2. Real-Time Updates (Server-Sent Events)
 
