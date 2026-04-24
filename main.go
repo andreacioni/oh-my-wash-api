@@ -349,7 +349,7 @@ func (app *Application) subscribePubSub(userID string) {
 			app.subMutex.Unlock()
 		}()
 
-		subscriptionName := fmt.Sprintf("%s-sub", userID)
+		subscriptionName := fmt.Sprintf("u_%s-sub", userID)
 		log.Printf("Ensuring Pub/Sub subscription %s exists", subscriptionName)
 		subscription := app.pubsubClient.Subscription(subscriptionName)
 
