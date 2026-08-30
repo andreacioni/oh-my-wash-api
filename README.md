@@ -27,7 +27,6 @@ This endpoint allows you to fetch the most recent status of all your registered 
         "deviceName": "Dev1",
         "deviceType": "manual",
         "productDate": 1776723000000,
-        "productType": "SRI",
         "rainIntensityMmh": 2.40
       },
       "device_id_2": {
@@ -35,7 +34,6 @@ This endpoint allows you to fetch the most recent status of all your registered 
         "deviceName": "Dev2",
         "deviceType": "android",
         "productDate": 1776173100000,
-        "productType": "SRI",
         "rainIntensityMmh": 1.20
       }
     }
