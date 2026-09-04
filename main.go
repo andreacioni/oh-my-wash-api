@@ -653,6 +653,11 @@ func (app *Application) HandleSSE(c *gin.Context) {
 func (app *Application) HandleGetLatestMessage(c *gin.Context) {
 	userID := c.GetString("userID")
 
+	// Prevent intermediary/client caching so clients always receive fresh data.
+	c.Header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+	c.Header("Pragma", "no-cache")
+	c.Header("Expires", "0")
+
 	// Apply rate limiting
 	limiter := app.userIdRateLimiter.GetLimiter(userID)
 	if !limiter.Allow() {
